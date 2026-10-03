@@ -32,10 +32,19 @@ import (
 // interface.
 type Block struct {
 	Type    string            // The type, taken from the preamble (i.e. "PGP SIGNATURE").
-	Header  map[string]string // Optional headers.
+	Header  map[string]string // Optional headers. The first value is used for duplicate headers.
+	Headers []Header          // Headers in their original order, including duplicates.
+	Offset  int64             // The byte offset of the BEGIN line in the original input.
 	Body    io.Reader         // A Reader from which the contents can be read
 	lReader lineReader
 	oReader openpgpReader
+	scanner *Scanner
+}
+
+// A Header is an OpenPGP armor header.
+type Header struct {
+	Key   string
+	Value string
 }
 
 var ArmorCorrupt error = errors.StructuralError("armor invalid")
