@@ -156,6 +156,31 @@ func (upte CriticalUnknownPacketTypeError) Error() string {
 	return "openpgp: unknown critical packet type: " + strconv.Itoa(int(upte))
 }
 
+// TruncatedPacketError indicates that a packet header or body declared more
+// bytes than the underlying stream provided. The packet number is 1-based and
+// counts packets as returned by the raw packet reader; Offset is the absolute
+// position in the input stream at which the missing byte was expected, and
+// PacketOffset is the same position relative to the start of the packet.
+//
+// Returning this error makes truncation explicit: a caller must never assemble
+// a new, seemingly complete packet from the partial data.
+type TruncatedPacketError struct {
+	PacketNumber int
+	Tag          uint8
+	Offset       int64
+	PacketOffset int64
+	Err          error
+}
+
+func (e *TruncatedPacketError) Error() string {
+	return fmt.Sprintf("openpgp: invalid data: packet #%d (tag %d) truncated at offset %d (byte %d within the packet): %v",
+		e.PacketNumber, e.Tag, e.Offset, e.PacketOffset, e.Err)
+}
+
+func (e *TruncatedPacketError) Unwrap() error {
+	return e.Err
+}
+
 // AEADError indicates that there is a problem when initializing or using a
 // AEAD instance, configuration struct, nonces or index values.
 type AEADError string
