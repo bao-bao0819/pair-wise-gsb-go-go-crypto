@@ -7,6 +7,7 @@ package openpgp
 import (
 	"bytes"
 	"crypto/rand"
+	"fmt"
 	"io"
 	mathrand "math/rand"
 	"testing"
@@ -352,6 +353,72 @@ func TestSymmetricEncryption(t *testing.T) {
 				t.Errorf("recovered message incorrect got '%s', want '%s'", messageBuf.Bytes(), message)
 			}
 		})
+	}
+}
+
+func TestSymmetricEncryptionStreamingLiteral(t *testing.T) {
+	// Exercises the bounded streaming literal writer through the real
+	// SymmetricallyEncrypt write path, including body lengths that divide
+	// evenly into the configured chunk size. Closing the plaintext must still
+	// close the underlying encrypted packet (legacy close-chains behavior).
+	lengths := []int{0, 1, 511, 512, 513, 4096, 4097, 4096*3 + 7}
+	for _, size := range lengths {
+		t.Run(fmt.Sprintf("len=%d", size), func(t *testing.T) {
+			config := &packet.Config{LiteralChunkSize: 512}
+			buf := new(bytes.Buffer)
+			plaintext, err := SymmetricallyEncrypt(buf, []byte("testing"), &FileHints{FileName: "f.bin", IsBinary: true}, config)
+			if err != nil {
+				t.Fatalf("SymmetricallyEncrypt: %s", err)
+			}
+
+			message := make([]byte, size)
+			rand.Read(message)
+			// A single, possibly large, Write must be fully accepted.
+			n, err := plaintext.Write(message)
+			if err != nil {
+				t.Fatalf("Write: %s", err)
+			}
+			if n != size {
+				t.Fatalf("Write accepted %d of %d", n, size)
+			}
+			if err := plaintext.Close(); err != nil {
+				t.Fatalf("Close: %s", err)
+			}
+
+			md, err := ReadMessage(buf, nil, func(keys []Key, symmetric bool) ([]byte, error) {
+				return []byte("testing"), nil
+			}, nil)
+			if err != nil {
+				t.Fatalf("ReadMessage: %s", err)
+			}
+			got, err := io.ReadAll(md.UnverifiedBody)
+			if err != nil {
+				t.Fatalf("read body: %s", err)
+			}
+			if !bytes.Equal(got, message) {
+				t.Fatalf("body mismatch: got %d bytes, want %d", len(got), size)
+			}
+		})
+	}
+}
+
+func TestSymmetricEncryptionStreamingLiteralInvalidChunk(t *testing.T) {
+	// A non power-of-two chunk size falls back to the legacy writer rather
+	// than failing encryption, because LiteralDataChunkSize sanitizes input.
+	config := &packet.Config{LiteralChunkSize: 513}
+	if got := config.LiteralDataChunkSize(); got != 0 {
+		t.Fatalf("LiteralDataChunkSize = %d, want 0 for invalid value", got)
+	}
+	buf := new(bytes.Buffer)
+	plaintext, err := SymmetricallyEncrypt(buf, []byte("testing"), nil, config)
+	if err != nil {
+		t.Fatalf("SymmetricallyEncrypt: %s", err)
+	}
+	if _, err := plaintext.Write([]byte("hello")); err != nil {
+		t.Fatalf("Write: %s", err)
+	}
+	if err := plaintext.Close(); err != nil {
+		t.Fatalf("Close: %s", err)
 	}
 }
 

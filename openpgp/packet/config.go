@@ -197,6 +197,13 @@ type Config struct {
 	// read from a compressed packet. This serves as an upper limit to prevent
 	// excessively large decompressed messages.
 	MaxDecompressedMessageSize *int64
+	// LiteralChunkSize selects the partial body chunk size (in bytes) used to
+	// serialize literal data packets through the streaming API. If zero, the
+	// legacy writer, which buffers up to a whole Write before flushing, is
+	// used. Otherwise it must be a power of two between 512 and 2^30; see RFC
+	// 4880, section 4.2.2.4. The streaming writer never holds more than
+	// LiteralChunkSize bytes of body data in memory.
+	LiteralChunkSize int
 }
 
 func (c *Config) Random() io.Reader {
@@ -218,6 +225,17 @@ func (c *Config) Cipher() CipherFunction {
 		return CipherAES128
 	}
 	return c.DefaultCipher
+}
+
+// LiteralDataChunkSize returns the configured partial body chunk size for
+// streaming literal data packets, or zero when the legacy writer should be
+// used (the zero or unset case). A value that does not satisfy the partial
+// body length constraints is returned as zero as well.
+func (c *Config) LiteralDataChunkSize() int {
+	if c == nil || !validPartialChunkSize(c.LiteralChunkSize) {
+		return 0
+	}
+	return c.LiteralChunkSize
 }
 
 func (c *Config) Now() time.Time {

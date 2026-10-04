@@ -11,6 +11,7 @@ import (
 	"crypto/cipher"
 	"crypto/rsa"
 	"io"
+	"math/bits"
 
 	"github.com/ProtonMail/go-crypto/openpgp/errors"
 	"github.com/ProtonMail/go-crypto/openpgp/internal/algorithm"
@@ -149,6 +150,195 @@ func (w *partialLengthWriter) Close() (err error) {
 		return err
 	}
 	return w.w.Close()
+}
+
+const (
+	// minPartialChunkSize is the smallest permitted partial body length.
+	// RFC 4880, section 4.2.2.4 requires the first partial length of a
+	// packet to encode at least 512 octets.
+	minPartialChunkSize = 512
+	// maxPartialChunkSize is the largest power-of-two length representable
+	// by a single partial length byte (224 + 30).
+	maxPartialChunkSize = 1 << 30
+)
+
+// validPartialChunkSize reports whether size is an admissible OpenPGP
+// partial body length: a power of two between 512 and 2^30 octets. See RFC
+// 4880, section 4.2.2.4.
+func validPartialChunkSize(size int) bool {
+	return size >= minPartialChunkSize &&
+		size <= maxPartialChunkSize &&
+		size&(size-1) == 0
+}
+
+// StreamWriter serializes an OpenPGP packet body using partial body lengths
+// with a fixed chunk size. It differs from partialLengthWriter in two ways:
+// the in-memory buffer never grows beyond chunkSize bytes regardless of the
+// size of a single Write, and finalizing the packet is separated from
+// closing the underlying writer.
+//
+// Incoming data is flushed as full partial chunks as soon as chunkSize
+// bytes have accumulated. Finish emits the final fixed-length chunk (an
+// empty one when the body length is an exact multiple of chunkSize) and is
+// idempotent, leaving the underlying writer open. Close finishes the packet
+// and then closes the underlying writer when it implements io.Closer.
+type StreamWriter struct {
+	w         io.Writer
+	chunkSize int
+	buf       []byte
+	err       error
+	finished  bool
+	closed    bool
+}
+
+// newStreamWriter returns a streamWriter that writes to w using partial
+// chunks of chunkSize bytes. chunkSize must be valid according to
+// validPartialChunkSize.
+func newStreamWriter(w io.Writer, chunkSize int) *StreamWriter {
+	return &StreamWriter{
+		w:         w,
+		chunkSize: chunkSize,
+		buf:       make([]byte, 0, chunkSize),
+	}
+}
+
+// Write accepts up to len(p) bytes of packet body and reports the number of
+// body bytes that have been accepted in n. The returned count refers only to
+// body data; partial length header bytes written to the underlying writer
+// are never counted.
+//
+// Once an error occurs it is sticky: all subsequent calls, including Write,
+// return it without touching the underlying writer or emitting any trailing
+// data that could be mistaken for a successful final chunk.
+func (w *StreamWriter) Write(p []byte) (n int, err error) {
+	if w.err != nil {
+		return 0, w.err
+	}
+	if w.finished {
+		w.err = errors.InvalidArgumentError("StreamWriter: Write called after Finish")
+		return 0, w.err
+	}
+
+	// First fill up any bytes already buffered.
+	if len(w.buf) > 0 {
+		prior := len(w.buf)
+		copied := copy(w.buf[len(w.buf):cap(w.buf)], p)
+		w.buf = w.buf[:len(w.buf)+copied]
+		n += copied
+		p = p[copied:]
+		if len(w.buf) == w.chunkSize {
+			m, ferr := w.flushChunk(w.buf)
+			w.buf = w.buf[:0]
+			if ferr != nil {
+				// The first m bytes to reach the underlying writer belonged
+				// to the previously buffered tail; only bytes beyond that
+				// were contributed by this call.
+				accepted := m - prior
+				if accepted < 0 {
+					accepted = 0
+				}
+				if accepted > n {
+					accepted = n
+				}
+				n = accepted
+				w.err = ferr
+				return n, ferr
+			}
+		}
+	}
+
+	// Emit complete chunks straight from p to avoid buffering the input.
+	for len(p) >= w.chunkSize {
+		m, ferr := w.flushChunk(p[:w.chunkSize])
+		n += m
+		if ferr != nil {
+			w.err = ferr
+			return n, ferr
+		}
+		p = p[w.chunkSize:]
+	}
+
+	// Retain the remaining partial tail within the bounded buffer.
+	if len(p) > 0 {
+		m := copy(w.buf[:cap(w.buf)], p)
+		w.buf = w.buf[:m]
+		n += m
+	}
+	return n, nil
+}
+
+// flushChunk writes a single partial length header (1 byte) followed by the
+// chunk body. It returns the number of body bytes accepted by the underlying
+// writer along with the first error (so callers can honor an (n, err) result
+// from the underlying writer). A body write that accepts too few bytes is
+// reported as io.ErrShortWrite.
+func (w *StreamWriter) flushChunk(chunk []byte) (int, error) {
+	power := bits.TrailingZeros(uint(w.chunkSize))
+	if _, err := w.w.Write([]byte{byte(224 + power)}); err != nil {
+		return 0, err
+	}
+	m, err := w.w.Write(chunk)
+	if err != nil {
+		return m, err
+	}
+	if m != len(chunk) {
+		return m, io.ErrShortWrite
+	}
+	return m, nil
+}
+
+// Finish terminates the packet body with a legal final fixed-length chunk,
+// flushing any buffered remainder (or a zero-length chunk when the body is an
+// exact multiple of the chunk size). It does not close the underlying
+// writer. Finish is idempotent: after the first successful or failed call,
+// later calls return the saved error without writing anything.
+func (w *StreamWriter) Finish() error {
+	if w.err != nil {
+		return w.err
+	}
+	if w.finished {
+		return nil
+	}
+
+	w.finished = true
+	if err := serializeLength(w.w, len(w.buf)); err != nil {
+		w.err = err
+		return err
+	}
+	if len(w.buf) > 0 {
+		n, err := w.w.Write(w.buf)
+		if err != nil {
+			w.err = err
+			return err
+		}
+		if n != len(w.buf) {
+			w.err = io.ErrShortWrite
+			return w.err
+		}
+	}
+	w.buf = w.buf[:0]
+	return nil
+}
+
+// Close finishes the packet body and, if the packet terminated successfully,
+// closes the underlying writer when it implements io.Closer. The first error
+// encountered is saved and returned on every subsequent call; the underlying
+// writer is never closed more than once (and never at all if finishing the
+// packet failed).
+func (w *StreamWriter) Close() error {
+	if err := w.Finish(); err != nil {
+		return err
+	}
+	if w.closed {
+		return w.err
+	}
+	w.closed = true
+	if c, ok := w.w.(io.Closer); ok {
+		if err := c.Close(); err != nil && w.err == nil {
+			w.err = err
+		}
+	}
+	return w.err
 }
 
 // A spanReader is an io.LimitReader, but it returns ErrUnexpectedEOF if the

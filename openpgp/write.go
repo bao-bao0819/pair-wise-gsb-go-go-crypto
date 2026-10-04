@@ -150,7 +150,44 @@ func SymmetricallyEncrypt(ciphertext io.Writer, passphrase []byte, hints *FileHi
 	if !hints.ModTime.IsZero() {
 		epochSeconds = uint32(hints.ModTime.Unix())
 	}
+
+	// When a chunk size is configured, serialize the literal packet through
+	// the bounded streaming writer so that a large (e.g. multi-megabyte)
+	// Write does not inflate the in-memory buffer. The returned closer keeps
+	// the historical behavior of SerializeLiteral: closing the literal packet
+	// also closes the underlying (compressed/encrypted) writer chain.
+	if chunkSize := config.LiteralDataChunkSize(); chunkSize != 0 {
+		stream, err := packet.SerializeLiteralStream(literalData, hints.IsBinary, hints.FileName, epochSeconds, chunkSize)
+		if err != nil {
+			return nil, err
+		}
+		return literalStreamCloser{stream: stream, underlying: literalData}, nil
+	}
+
 	return packet.SerializeLiteral(literalData, hints.IsBinary, hints.FileName, epochSeconds)
+}
+
+// literalStreamCloser adapts the bounded *packet.StreamWriter (whose Finish
+// deliberately does not close the underlying writer) to the io.WriteCloser
+// contract historically returned by SerializeLiteral, where closing the
+// literal packet also closes the underlying writer chain.
+type literalStreamCloser struct {
+	stream     *packet.StreamWriter
+	underlying io.Closer
+}
+
+func (c literalStreamCloser) Write(p []byte) (int, error) {
+	return c.stream.Write(p)
+}
+
+func (c literalStreamCloser) Close() error {
+	// Finish the literal packet without closing the underlying writer ...
+	if err := c.stream.Finish(); err != nil {
+		return err
+	}
+	// ... then close the underlying (compressed/encrypted) writer, matching
+	// the behavior callers previously got from SerializeLiteral.
+	return c.underlying.Close()
 }
 
 // intersectPreferences mutates and returns a prefix of a that contains only
